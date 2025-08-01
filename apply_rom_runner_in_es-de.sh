@@ -14,7 +14,7 @@ usage() {
     echo "  <path_to_es_systems.xml> : The absolute or relative path to the es_systems.xml file."
     echo ""
     echo "Example:"
-    echo "  $0 /etc/emulationstation/es_systems.xml"
+    echo "  $0 $HOME/ES-DE/custom_systems/es_systems.xml"
     exit 1
 }
 
@@ -49,9 +49,6 @@ if [ ! -f "$ES_SYSTEMS_FILE" ]; then
     echo "Error: File '$ES_SYSTEMS_FILE' not found."
     exit 1
 fi
-
-sudo cp rom_runner_wrapper.sh /bin/rom_runner_wrapper
-sudo cp rom_manager.sh /bin/rom_manager
 
 # --- Create a backup of the original file ---
 BACKUP_FILE="${ES_SYSTEMS_FILE}.bak"
