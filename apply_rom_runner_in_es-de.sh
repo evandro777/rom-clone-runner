@@ -51,7 +51,7 @@ if [ ! -f "$ES_SYSTEMS_FILE" ]; then
 fi
 
 # --- Create a backup of the original file ---
-BACKUP_FILE="${ES_SYSTEMS_FILE}.bak"
+BACKUP_FILE="${ES_SYSTEMS_FILE}_$(date +%Y-%m-%d_%H-%M-%S).bak"
 cp "$ES_SYSTEMS_FILE" "$BACKUP_FILE"
 echo "Backup created: '$BACKUP_FILE'"
 
