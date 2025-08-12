@@ -20,10 +20,10 @@ usage() {
 
 # --- Default Configuration Constants ---
 # Comma-separated list of system names to target for 'rom_runner_wrapper' addition.
-DEFAULT_SYSTEM_NAMES="gamegear,megadrive,mastersystem,gba,n64,nes,satellaview,sega32x,sega32xjp,sega32xna,sfc,snes,snesna,sufami"
+DEFAULT_SYSTEM_NAMES="gamegear,megadrive,mastersystem,gba,n64,nes,satellaview,sega32x,sega32xjp,sega32xna,sfc,snes,snesna,sufami,scummvm"
 
 # Comma-separated list of command labels to target for 'rom_runner_wrapper' addition.
-DEFAULT_COMMAND_LABELS="Genesis Plus GX,Genesis Plus GX Wide,mGBA,Mupen64Plus-Next,Mesen,Snes9x - Current,PicoDrive"
+DEFAULT_COMMAND_LABELS="Genesis Plus GX,Genesis Plus GX Wide,mGBA,Mupen64Plus-Next,Mesen,Snes9x - Current,PicoDrive,ScummVM"
 
 # Wrapper string to be prepended
 WRAPPER="rom_runner_wrapper "
