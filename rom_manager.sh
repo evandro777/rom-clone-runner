@@ -27,6 +27,12 @@ Optional options:
                    'copy'    → copy files instead of linking
                    'move'    → move files instead of linking
   -t CHD_SRC_DIR   Directory containing CHD folders to be linked if matching archive names
+  -u SCUMMVM_INI   Path to scummvm.ini — when provided and using -c folder, the script will
+                   search scummvm.ini for entries whose path's last component matches each
+                   internal folder inside the archive. If found, it will create two files
+                   inside the created ROM folder: <internal_folder>.scummvm (containing the id)
+                   and <internal_folder>.ini (containing the full matching block). The script
+                   uses 'crudini' if available to fetch the 'path' value for each section.
   -h               Show this help message and exit
 
 Examples:
@@ -49,6 +55,7 @@ SRC_DIR=""
 DEST_BASE=""
 OPERATION_TYPE="symlink"
 CHD_SRC_DIR=""
+SCUMMVM_INI=""
 DEBUG_ENABLED=false
 
 # Parse arguments
@@ -60,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         -d) DEST_BASE="$2"; shift 2 ;;
         -o) OPERATION_TYPE="$2"; shift 2 ;;
         -t) CHD_SRC_DIR="$2"; shift 2 ;;
+        -u) SCUMMVM_INI="$2"; shift 2 ;;
         --debug) DEBUG_ENABLED=true; shift ;;
         -h) usage ;;
         *) echo "Unknown option: $1" >&2; usage ;;
@@ -172,6 +180,149 @@ create_chd_symlink_if_exists() {
     handle_file_operation "$rel_chd" "$dest_dir/$name"
 }
 
+# Handle scummvm
+handle_scummvm_config() {
+    local clone_base="$1"
+    local clone_dir="$2"
+    local parent_archive="$clone_dir/$clone_base.7z"  # path to the original .7z archive
+
+    [[ -z "${SCUMMVM_INI:-}" ]] && return
+
+    # Priority map for determining default language
+    local -A priority_map=(
+        [default]=0
+        [en]=1
+        [us]=2
+        [gb]=3
+    )
+
+    # Mapping language codes to readable names
+    local -A lang_map=(
+        # English variants
+        [en]="English"
+        [us]="English (US)"
+        [gb]="English (UK)"
+        [au]="English (AU)"
+        # European languages
+        [de]="German"
+        [fr]="French"
+        [es]="Spanish"
+        [it]="Italian"
+        [pt]="Portuguese"
+        [br]="Portuguese (BR)"
+        [pt_BR]="Portuguese (BR)"
+        [pt_PT]="Portuguese (PT)"
+        [nl]="Dutch"
+        [da]="Danish"
+        [sv]="Swedish"
+        [no]="Norwegian"
+        [fi]="Finnish"
+        [pl]="Polish"
+        [cs]="Czech"
+        [sk]="Slovak"
+        [hu]="Hungarian"
+        [ro]="Romanian"
+        [bg]="Bulgarian"
+        [el]="Greek"
+        [tr]="Turkish"
+        # Asian languages
+        [ru]="Russian"
+        [uk]="Ukrainian"
+        [jp]="Japanese"
+        [ja]="Japanese"
+        [zh]="Chinese"
+        [zh_CN]="Chinese (Simplified)"
+        [zh_TW]="Chinese (Traditional)"
+        [ko]="Korean"
+        # Middle Eastern
+        [ar]="Arabic"
+        [he]="Hebrew"
+        [fa]="Persian"
+    )
+
+    # Collect all sections that match this clone_base
+    local -a sections=()
+    declare -A section_lang=()
+    while IFS= read -r section; do
+        [[ "$section" == "scummvm" ]] && continue
+        local path
+        path=$(crudini --get "$SCUMMVM_INI" "$section" path 2>/dev/null || true)
+        [[ -z "$path" ]] && continue
+        local last_part
+        last_part=$(basename "$path")
+        [[ "$last_part" == "$clone_base" ]] && sections+=("$section")
+    done < <(crudini --get "$SCUMMVM_INI")
+
+    [[ ${#sections[@]} -eq 0 ]] && return
+
+    # Determine the default section based on priority
+    local best_section=""
+    local best_prio=999
+    for section in "${sections[@]}"; do
+        local language
+        language=$(crudini --get "$SCUMMVM_INI" "$section" language 2>/dev/null || true)
+
+        local prio=999
+        if [[ -z "$language" ]]; then
+            prio=${priority_map[default]}
+            section_lang["$section"]="Default"
+        elif [[ -n "${priority_map[$language]:-}" ]]; then
+            prio=${priority_map[$language]}
+            section_lang["$section"]="${lang_map[$language]:-$language}"
+        else
+            section_lang["$section"]="${lang_map[$language]:-$language}"
+        fi
+
+        (( prio < best_prio )) && { best_prio=$prio; best_section=$section; }
+    done
+
+    # Create default ScummVM files
+    local base_name="$clone_dir/$clone_base"
+    local scummvm_file="${base_name}.scummvm"
+    local ini_file="${base_name}.ini"
+
+    echo "$best_section" > "$scummvm_file"
+    {
+        echo "[$best_section]"
+        while IFS= read -r key; do
+            local val
+            val=$(crudini --get "$SCUMMVM_INI" "$best_section" "$key" 2>/dev/null || true)
+            echo "$key=$val"
+        done < <(crudini --get "$SCUMMVM_INI" "$best_section")
+    } > "$ini_file"
+
+    echo "  ScummVM config exported (default): ${scummvm_file##*/}, ${ini_file##*/}"
+
+    # Only create languages folder if there are languages variants
+    local languages_created=false
+    for section in "${sections[@]}"; do
+        [[ "$section" == "$best_section" ]] && continue
+        [[ "$languages_created" == false ]] && { mkdir -p "$clone_dir/languages"; languages_created=true; }
+
+        local lang_name="${section_lang[$section]}"
+        local scummvm_file="${clone_dir}/languages/${clone_base}__languages-${lang_name}.scummvm"
+        local ini_file="${clone_dir}/languages/${clone_base}__languages-${lang_name}.ini"
+
+        # Write ScummVM id file
+        echo "$section" > "$scummvm_file"
+
+        # Export full section with key=value
+        {
+            echo "[$section]"
+            while IFS= read -r key; do
+                local val
+                val=$(crudini --get "$SCUMMVM_INI" "$section" "$key" 2>/dev/null || true)
+                echo "$key=$val"
+            done < <(crudini --get "$SCUMMVM_INI" "$section")
+        } > "$ini_file"
+
+        # Create symlink to original .7z inside languages folder
+        ln -sf "../$(basename "$parent_archive")" "$clone_dir/languages/$(basename "$parent_archive")"
+
+        echo "  ScummVM config exported (variant): ${scummvm_file##*/}, ${ini_file##*/}"
+    done
+}
+
 # This function finds internal files/folders within the 7z that can be considered clones.
 # It returns their *base names* (e.g., "Simpsons Trivia (v1.00)" from "Simpsons Trivia (v1.00).sms").
 find_internal_clone_base_names() {
@@ -188,7 +339,7 @@ find_internal_clone_base_names() {
     if [[ "$CLONES_METHOD" == "file" ]]; then
         mapfile -t internal_items_raw < <(7z l "$parent_archive_path" | grep --fixed-strings -e " ....A " -e " ..... " | awk '{ print substr($0, 54) }' | grep -v '/')
     elif [[ "$CLONES_METHOD" == "folder" ]]; then
-        mapfile -t internal_items_raw < <(7z l "$parent_archive_path" | grep --fixed-strings " D.... " | awk '{ print substr($0, 54) }')
+        mapfile -t internal_items_raw < <(7z l "$parent_archive_path" | grep --fixed-strings " D.... " | awk '{ print substr($0, 54) }' | grep -v '/')
     fi
 
     debug "  DEBUG: Internal items found in '$parent_archive_path':" >&2
@@ -247,6 +398,8 @@ process_archive() {
 
     create_chd_symlink_if_exists "$base_name" "$current_dest_dir"
 
+    handle_scummvm_config "$base_name" "$current_dest_dir"
+
     if [[ "$CLONES_ENABLED" == true ]]; then
         debug "Searching for internal clones in $archive"
         local internal_clone_base_names=()
@@ -264,6 +417,7 @@ process_archive() {
                 echo "  Clone symlink created: $clone_path -> $rel_target"
                 
                 create_chd_symlink_if_exists "$base_name" "$clones_dir"
+                handle_scummvm_config "$clone_base" "$clones_dir"
             done
         else
             debug "No internal clones found in $archive"

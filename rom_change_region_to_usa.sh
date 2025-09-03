@@ -96,7 +96,7 @@ for dir in "$ROMS_DIR"/*; do
 
         # DEPRIORITIZE: Virtual Console Releases (subtracts points)
         # "Super Metroid (Japan, USA)" > "Super Metroid (USA, Europe) (Switch Online)"
-        if [[ "$item" =~ (Switch[[:space:]]Online|Wii|Arcade|Virtual[[:space:]]Console|Classic[[:space:]]Mini) ]]; then
+        if [[ "$item" =~ (Switch[[:space:]]Online|Wii|Arcade|Virtual[[:space:]]Console|GameCube[[:space:]]Edition|e-Reader[[:space:]]Edition|Classic[[:space:]]Mini) ]]; then
             current_score=$((current_score - 100))
         fi
 
