@@ -225,6 +225,7 @@ handle_scummvm_config() {
         [bg]="Bulgarian"
         [el]="Greek"
         [tr]="Turkish"
+        [hr]="Croatian"
         # Asian languages
         [ru]="Russian"
         [uk]="Ukrainian"
@@ -270,11 +271,22 @@ handle_scummvm_config() {
             prio=${priority_map[$language]}
             section_lang["$section"]="${lang_map[$language]:-$language}"
         else
+            # Not in priority map -> assign lowest possible priority, but still valid
+            prio=998
             section_lang["$section"]="${lang_map[$language]:-$language}"
         fi
 
-        (( prio < best_prio )) && { best_prio=$prio; best_section=$section; }
+        # Choose best section (lowest priority number wins)
+        if (( prio < best_prio )); then
+            best_prio=$prio
+            best_section=$section
+        fi
     done
+
+    # Safety: if no best_section found, fallback to the first section
+    if [[ -z "$best_section" && ${#sections[@]} -gt 0 ]]; then
+        best_section="${sections[0]}"
+    fi
 
     # Create default ScummVM files
     local base_name="$clone_dir/$clone_base"
@@ -300,8 +312,8 @@ handle_scummvm_config() {
         [[ "$languages_created" == false ]] && { mkdir -p "$clone_dir/languages"; languages_created=true; }
 
         local lang_name="${section_lang[$section]}"
-        local scummvm_file="${clone_dir}/languages/${clone_base}__languages-${lang_name}.scummvm"
-        local ini_file="${clone_dir}/languages/${clone_base}__languages-${lang_name}.ini"
+        local scummvm_file="${clone_dir}/languages/${clone_base}__Languages-${lang_name}.scummvm"
+        local ini_file="${clone_dir}/languages/${clone_base}__Languages-${lang_name}.ini"
 
         # Write ScummVM id file
         echo "$section" > "$scummvm_file"

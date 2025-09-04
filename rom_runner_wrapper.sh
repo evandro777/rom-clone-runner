@@ -34,14 +34,37 @@ if [[ "$ROM_INPUT" == *.scummvm ]]; then
         exit 1
     fi
 
+    # List archive contents
+    FILES=$(7z l -ba "$ARCHIVE_PATH" | sed -E 's/^.{53}//' | sed 's/^[ ]*//')
+
+    # Try exact match (folder)
+    MATCHED=""
+    while IFS= read -r file; do
+        [[ "$file" == "$ROM_BASENAME/"* ]] && MATCHED="$ROM_BASENAME" && break
+    done <<< "$FILES"
+
+    # Fallback with "__"
+    if [[ -z "$MATCHED" && "$ROM_BASENAME" == *"__"* ]]; then
+        BASE_PREFIX="${ROM_BASENAME%%__*}"
+        while IFS= read -r file; do
+            [[ "$file" == "$BASE_PREFIX/"* ]] && MATCHED="$BASE_PREFIX" && break
+        done <<< "$FILES"
+    fi
+
+    if [[ -z "$MATCHED" ]]; then
+        echo "[ERROR] No matching folder found inside archive." >&2
+        exit 1
+    fi
+
+    TARGET_DIR="$CACHE_DIR/scummvm/$MATCHED"
+
     if [[ -d "$TARGET_DIR" && -n "$(ls -A "$TARGET_DIR")" ]]; then
         echo "[INFO] Archive already extracted, skipping extraction."
     else
-        echo "[INFO] Extracting full archive to: $TARGET_DIR"
+        echo "[INFO] Extracting folder '$MATCHED/' to: $TARGET_DIR"
         mkdir -p "$TARGET_DIR"
-
-        7z x -y "$ARCHIVE_PATH" -o"$TARGET_DIR" || {
-            echo "[ERROR] Failed to extract archive." >&2
+        7z x -y "$ARCHIVE_PATH" -o"$CACHE_DIR/scummvm" "$MATCHED/*" || {
+            echo "[ERROR] Failed to extract folder." >&2
             exit 1
         }
     fi
@@ -83,10 +106,7 @@ if [[ "$ROM_INPUT" == *.scummvm ]]; then
         if [[ -n "$SCUMMVM_INI_PATH" ]]; then
             echo "[INFO] Found scummvm.ini at: $SCUMMVM_INI_PATH"
 
-            # Ensure correct path in GAME_INI before merge
-            crudini --set "$GAME_INI" "$GAME_ID" path "$TARGET_DIR"
-
-            # Read all keys from GAME_INI for the gameid
+            # Read all keys from GAME_INI for the gameid, but reversed
             mapfile -t keys < <(crudini --get "$GAME_INI" "$GAME_ID")
 
             # Apply all keys to SCUMMVM_INI_PATH
@@ -94,6 +114,9 @@ if [[ "$ROM_INPUT" == *.scummvm ]]; then
                 value=$(crudini --get "$GAME_INI" "$GAME_ID" "$key")
                 crudini --set "$SCUMMVM_INI_PATH" "$GAME_ID" "$key" "$value"
             done
+
+            # Ensure correct path in GAME_INI before merge
+            crudini --set "$SCUMMVM_INI_PATH" "$GAME_ID" path "$TARGET_DIR"
 
             echo "[INFO] Game settings for [$GAME_ID] applied via crudini."
         else
