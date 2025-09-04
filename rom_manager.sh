@@ -225,7 +225,6 @@ handle_scummvm_config() {
         [bg]="Bulgarian"
         [el]="Greek"
         [tr]="Turkish"
-        [hr]="Croatian"
         # Asian languages
         [ru]="Russian"
         [uk]="Ukrainian"
@@ -271,22 +270,14 @@ handle_scummvm_config() {
             prio=${priority_map[$language]}
             section_lang["$section"]="${lang_map[$language]:-$language}"
         else
-            # Not in priority map -> assign lowest possible priority, but still valid
             prio=998
             section_lang["$section"]="${lang_map[$language]:-$language}"
         fi
 
-        # Choose best section (lowest priority number wins)
-        if (( prio < best_prio )); then
-            best_prio=$prio
-            best_section=$section
-        fi
+        (( prio < best_prio )) && { best_prio=$prio; best_section=$section; }
     done
 
-    # Safety: if no best_section found, fallback to the first section
-    if [[ -z "$best_section" && ${#sections[@]} -gt 0 ]]; then
-        best_section="${sections[0]}"
-    fi
+    [[ -z "$best_section" && ${#sections[@]} -gt 0 ]] && best_section="${sections[0]}"
 
     # Create default ScummVM files
     local base_name="$clone_dir/$clone_base"
@@ -305,15 +296,18 @@ handle_scummvm_config() {
 
     echo "  ScummVM config exported (default): ${scummvm_file##*/}, ${ini_file##*/}"
 
-    # Only create languages folder if there are languages variants
+    # Only create languages folder if there are language variants
     local languages_created=false
     for section in "${sections[@]}"; do
         [[ "$section" == "$best_section" ]] && continue
         [[ "$languages_created" == false ]] && { mkdir -p "$clone_dir/languages"; languages_created=true; }
 
         local lang_name="${section_lang[$section]}"
-        local scummvm_file="${clone_dir}/languages/${clone_base}__Languages-${lang_name}.scummvm"
-        local ini_file="${clone_dir}/languages/${clone_base}__Languages-${lang_name}.ini"
+        local base_variant="${clone_dir}/languages/${clone_base}__Languages-${lang_name}"
+
+        local scummvm_file="${base_variant}.scummvm"
+        local ini_file="${base_variant}.ini"
+        local archive_symlink="${base_variant}.7z"
 
         # Write ScummVM id file
         echo "$section" > "$scummvm_file"
@@ -328,10 +322,10 @@ handle_scummvm_config() {
             done < <(crudini --get "$SCUMMVM_INI" "$section")
         } > "$ini_file"
 
-        # Create symlink to original .7z inside languages folder
-        ln -sf "../$(basename "$parent_archive")" "$clone_dir/languages/$(basename "$parent_archive")"
+        # Create symlink to original .7z inside languages folder with matching suffix
+        ln -sf "../$(basename "$parent_archive")" "$archive_symlink"
 
-        echo "  ScummVM config exported (variant): ${scummvm_file##*/}, ${ini_file##*/}"
+        echo "  ScummVM config exported (variant): ${scummvm_file##*/}, ${ini_file##*/}, ${archive_symlink##*/}"
     done
 }
 
