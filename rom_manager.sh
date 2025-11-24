@@ -36,14 +36,17 @@ Optional options:
   -h               Show this help message and exit
 
 Examples:
-  # Create folder per archive, only parent links (default behavior)
-  $0 -m folder -s /roms -d /output
+  # Create folder per archive, only parent links
+  $0 -m folder -s roms -d output
 
   # Create folder per archive, including clone links based on internal files
-  $0 -m folder -c file -s /roms -d /output
+  $0 -m folder -c file -s roms -d output
 
-  # Flat symlink structure, with clones based on internal folders
-  $0 -m file -c folder -s /roms -d /output -t /chdsource
+  # MAME: Create folder per archive, with clones based on internal folders and using chd files
+  $0 -m folder -c folder -s roms -d output -t chdsource
+  
+  # scummVM: Flat symlink structure, with clones based on internal folders and using scummvm.ini
+  $0 -m folder -s ROMs-raw -d ROMs -c folder -o move -u "$HOME/.var/app/org.scummvm.ScummVM/config/scummvm/scummvm.ini"
 EOF
     exit 1
 }
@@ -303,7 +306,7 @@ handle_scummvm_config() {
         [[ "$languages_created" == false ]] && { mkdir -p "$clone_dir/languages"; languages_created=true; }
 
         local lang_name="${section_lang[$section]}"
-        local base_variant="${clone_dir}/languages/${clone_base}__Languages-${lang_name}"
+        local base_variant="${clone_dir}/languages/${clone_base}__Language-${lang_name}"
 
         local scummvm_file="${base_variant}.scummvm"
         local ini_file="${base_variant}.ini"
