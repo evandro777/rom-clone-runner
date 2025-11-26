@@ -41,3 +41,6 @@ This has these mainly scripts:
     3. Script will read the filename, search for this filename inside the package and extract it in a /tmp folder
         1. This is why use a "symlink" for clones.
     4. Then will run the extracted file
+    5. This also has custom rules for:
+        1. Scummvm: Extract and keep in `/tmp`, clearing every boot. Also can read and apply custom scummvm configurations for each game (*.ini)
+        2. Mupen64plus for using hires_texture (auto mount hires_texture/*.erofs) and cache (temporary in /tmp => clear every boot)

@@ -14,13 +14,128 @@ ROM_EXT="${ROM_FILENAME##*.}"
 EXTRACTED=""
 
 # === Function to link complementary files ===
-link_related_files() {
+function link_related_files() {
     echo "[INFO] Linking companion files..."
     while IFS= read -r f; do
         target="$CACHE_DIR/$(basename "$f")"
         [[ -e "$target" ]] || ln -s "$(realpath "$f")" "$target"
     done < <(find "$ROM_DIR" -maxdepth 1 -type f -name "$ROM_BASENAME.*" ! -name "$ROM_FILENAME")
 }
+
+handle_n64_hires_texture() {
+    local rom_dir="$1"         # directory containing the .7z archive
+    local rom_basename="$2"    # ROM base name without extension
+    local hires_dir_src="$rom_dir/hires_texture"
+
+    echo "[INFO] Nintendo 64 ROM detected. Checking texture packs..."
+
+    # Check if hires_texture directory exists
+    if [[ ! -d "$hires_dir_src" ]]; then
+        echo "[INFO] No 'hires_texture' directory found. Skipping N64 texture mount."
+        return
+    fi
+
+    # Find .erofs file
+    local erofs_file
+    erofs_file=$(find "$hires_dir_src" -maxdepth 1 -type f -iname "*.erofs" | head -n 1)
+
+    if [[ -z "$erofs_file" ]]; then
+        echo "[INFO] No .erofs texture file found. Skipping N64 mount."
+        return
+    fi
+
+    local erofs_name
+    erofs_name=$(basename "$erofs_file" .erofs)
+
+    # RetroArch flatpak
+    local ra_flatpak="$HOME/.var/app/org.libretro.RetroArch/config/retroarch/system/Mupen64plus"
+
+    # RetroArch local
+    local ra_local="$HOME/.config/retroarch/system/Mupen64plus"
+
+    local target_base=""
+
+    # Priority check — but **only if folder exists**
+    if [[ -d "$ra_flatpak" ]]; then
+        target_base="$ra_flatpak"
+    elif [[ -d "$ra_local" ]]; then
+        target_base="$ra_local"
+    else
+        echo "[INFO] No RetroArch Mupen64plus folder found. Skipping N64 texture mount."
+        return
+    fi
+
+    local target_mount="$target_base/hires_texture/$erofs_name"
+    mkdir -p "$target_mount"
+
+    # Check sudo availability
+    if sudo -n true 2>/dev/null; then
+        CAN_SUDO=true
+        echo "[INFO] sudo available for mount."
+    else
+        CAN_SUDO=false
+        echo "[INFO] sudo NOT available for mount."
+    fi
+
+    # === Prepare cache BEFORE mount ===
+    local mupen_cache_dir="$target_base/cache"
+    mkdir -p /tmp/Mupen64plusCache
+
+    if [[ -e "$mupen_cache_dir" ]]; then
+        if [[ -L "$mupen_cache_dir" ]]; then
+            local real_target
+            real_target=$(readlink -f "$mupen_cache_dir")
+
+            if [[ "$real_target" != "/tmp/Mupen64plusCache" ]]; then
+                echo "[INFO] Updating incorrect cache symlink..."
+                rm -f "$mupen_cache_dir"
+                ln -s /tmp/Mupen64plusCache "$mupen_cache_dir"
+            else
+                echo "[INFO] Cache already using /tmp/Mupen64plusCache."
+            fi
+        else
+            echo "[INFO] Replacing existing cache directory with symlink..."
+            rm -rf "$mupen_cache_dir"
+            ln -s /tmp/Mupen64plusCache "$mupen_cache_dir"
+        fi
+    else
+        echo "[INFO] Creating cache symlink to /tmp."
+        ln -s /tmp/Mupen64plusCache "$mupen_cache_dir"
+    fi
+
+    # === Unmount old mount if needed ===
+    if mountpoint -q "$target_mount"; then
+        echo "[INFO] Unmounting previous mount at $target_mount..."
+
+        if $CAN_SUDO; then
+            sudo umount "$target_mount" 2>/dev/null || fusermount -u "$target_mount"
+        else
+            fusermount -u "$target_mount" 2>/dev/null
+        fi
+    fi
+
+    echo "[INFO] Attempting to mount EROFS texture: $erofs_file"
+
+    # === Attempt kernel mount ===
+    if $CAN_SUDO; then
+        echo sudo mount -t erofs "$erofs_file" "$target_mount"
+        if sudo mount -t erofs "$erofs_file" "$target_mount" 2>/dev/null; then
+            echo "[INFO] Mounted via kernel EROFS driver."
+            return
+        fi
+    fi
+
+    # === Attempt FUSE mount ===
+    if command -v erofs-fuse >/dev/null; then
+        if erofs-fuse "$erofs_file" "$target_mount" 2>/dev/null; then
+            echo "[INFO] Mounted via erofs-fuse."
+            return
+        fi
+    fi
+
+    echo "[ERROR] Failed to mount EROFS texture file: $erofs_file"
+}
+
 
 # === Handle .scummvm special case ===
 if [[ "$ROM_INPUT" == *.scummvm ]]; then
@@ -171,6 +286,16 @@ elif [[ "$ROM_INPUT" == *.7z ]]; then
 
     link_related_files
     ROM_INPUT="$EXTRACTED"
+
+    # Check if ROM is Nintendo 64 by looking at the extension inside the archive
+    FIRST_FILE=$(echo "$FILES" | grep -Ei '\.(z64|n64|v64)$' | head -n 1)
+    IS_N64=false
+    [[ -n "$FIRST_FILE" ]] && IS_N64=true
+
+    # Isolated Nintendo 64 handler
+    if $IS_N64; then
+        handle_n64_hires_texture "$ROM_DIR" "$ARCHIVE_BASE"
+    fi
 
 # === Handle non-archive ROMs (e.g., .bps passed directly) ===
 else
