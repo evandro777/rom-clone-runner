@@ -1,207 +1,277 @@
 #!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
 
 # === CONFIG ===
 CACHE_DIR="/tmp/rom_runner_wrapper"
+TMP_MUPEN_CACHE="/tmp/Mupen64plusCache"
 mkdir -p "$CACHE_DIR"
 
-# Get all arguments except the last (emulator command and options)
-CMD_ARGS=("${@:1:$(($#-1))}")
-ROM_INPUT="${!#}"  # Last argument is the ROM path
-ROM_DIR=$(dirname "$ROM_INPUT")
-ROM_FILENAME=$(basename "$ROM_INPUT")
-ROM_BASENAME="${ROM_FILENAME%.*}"  # Without extension
-ROM_EXT="${ROM_FILENAME##*.}"
-EXTRACTED=""
+# === Logging helpers ===
+log()   { printf '[INFO] %s\n' "$*"; }
+warn()  { printf '[WARN] %s\n' "$*" >&2; }
+error() { printf '[ERROR] %s\n' "$*" >&2; }
+die()   { error "$*"; exit 1; }
 
-# === Function to link complementary files ===
-function link_related_files() {
-    echo "[INFO] Linking companion files..."
+# === Dependency check ===
+check_deps() {
+    command -v 7z >/dev/null 2>&1 || die "7z (p7zip) is required but not found."
+    if command -v crudini >/dev/null 2>&1; then
+        HAVE_CRUDINI=true
+    else
+        HAVE_CRUDINI=false
+        warn "crudini not found — scummvm INI merging will be skipped."
+    fi
+    if command -v erofsfuse >/dev/null 2>&1; then
+        HAVE_EROFSFUSE=true
+    else
+        HAVE_EROFSFUSE=false
+    fi
+}
+check_deps
+
+# === Utility wrappers for archive and extraction ===
+
+# Trim 7z listing to filename column (works with p7zip output)
+list_archive_files() {
+    local archive="$1"
+    7z l -ba "$archive" | sed -E 's/^.{53}//' | sed 's/^[ ]*//'
+}
+
+# Extract a single file from archive to destination (stream extract)
+extract_file_from_archive() {
+    local archive="$1"
+    local file_in_archive="$2"
+    local dest="$3"
+    7z e -y -so "$archive" "$file_in_archive" > "$dest"
+}
+
+# Extract a folder from archive into a parent dir (creates parent_dir/folder...)
+extract_folder_from_archive() {
+    local archive="$1"
+    local folder_in_archive="$2"   # folder name inside archive (no trailing slash)
+    local parent_dir="$3"
+    mkdir -p "$parent_dir"
+    7z x -y "$archive" "$folder_in_archive/*" -o"$parent_dir"
+}
+
+# Link companion files (create symlinks in cache dir)
+link_related_files() {
+    # depends on ROM_DIR, ROM_BASENAME, ROM_FILENAME existing in caller scope
+    log "Linking companion files..."
     while IFS= read -r f; do
-        target="$CACHE_DIR/$(basename "$f")"
+        local target="$CACHE_DIR/$(basename "$f")"
         [[ -e "$target" ]] || ln -s "$(realpath "$f")" "$target"
     done < <(find "$ROM_DIR" -maxdepth 1 -type f -name "$ROM_BASENAME.*" ! -name "$ROM_FILENAME")
 }
 
+# === Helpers for sudo / mounts ===
+
+# Return 0 if sudo is available non-interactively
+can_use_sudo() {
+    if sudo -n true 2>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Generic EROFS mount handler
+# mount_erofs_texture <erofs_file> <target_mount>
+# returns 0 on success, 1 on failure
+mount_erofs_texture() {
+    local erofs_file="$1"
+    local target_mount="$2"
+
+    [[ -f "$erofs_file" ]] || { error "erofs file not found: $erofs_file"; return 1; }
+
+    log "Mount handler: $erofs_file -> $target_mount"
+    mkdir -p "$target_mount"
+
+    local CAN_SUDO=false
+    if can_use_sudo; then
+        CAN_SUDO=true
+        log "sudo available for kernel mount."
+    else
+        log "sudo NOT available for kernel mount."
+    fi
+
+    # If something is mounted at target, unmount it (simpler behaviour you requested)
+    if mountpoint -q "$target_mount"; then
+        log "Mountpoint exists at $target_mount — unmounting first."
+        if $CAN_SUDO; then
+            sudo umount "$target_mount" 2>/dev/null || fusermount -u "$target_mount" 2>/dev/null || warn "Failed to unmount previous mount (tried sudo then fusermount)."
+        else
+            fusermount -u "$target_mount" 2>/dev/null || warn "Failed to unmount previous mount (no sudo)."
+        fi
+    fi
+
+    # Try kernel mount if possible
+    if $CAN_SUDO; then
+        if sudo mount -t erofs "$erofs_file" "$target_mount" 2>/dev/null; then
+            log "Mounted via kernel erofs driver at $target_mount"
+            return 0
+        else
+            warn "Kernel erofs mount failed or unsupported."
+        fi
+    fi
+
+    # Try erofsfuse (FUSE) fallback
+    if [[ "$HAVE_EROFSFUSE" == true ]]; then
+        if erofsfuse "$erofs_file" "$target_mount" 2>/dev/null; then
+            log "Mounted via erofsfuse at $target_mount"
+            return 0
+        else
+            warn "erofsfuse mount failed."
+        fi
+    else
+        warn "erofsfuse not installed; skipping FUSE fallback."
+    fi
+
+    error "Failed to mount erofs file: $erofs_file"
+    return 1
+}
+
+# Prepare mupen cache symlink safely
+prepare_mupen_cache() {
+    local target_base="$1"   # Mupen64plus parent dir (not including hires_texture)
+    local mupen_cache_dir="$target_base/cache"
+
+    mkdir -p "$TMP_MUPEN_CACHE"
+
+    if [[ -e "$mupen_cache_dir" ]]; then
+        if [[ -L "$mupen_cache_dir" ]]; then
+            local real_target
+            real_target=$(readlink -f "$mupen_cache_dir" 2>/dev/null || true)
+            if [[ "$real_target" != "$TMP_MUPEN_CACHE" ]]; then
+                log "Cache symlink points elsewhere — updating to $TMP_MUPEN_CACHE"
+                rm -f "$mupen_cache_dir"
+                ln -s "$TMP_MUPEN_CACHE" "$mupen_cache_dir"
+            else
+                log "Cache already redirected to $TMP_MUPEN_CACHE"
+            fi
+        else
+            log "Replacing existing real cache dir with symlink to $TMP_MUPEN_CACHE"
+            rm -rf "$mupen_cache_dir"
+            ln -s "$TMP_MUPEN_CACHE" "$mupen_cache_dir"
+        fi
+    else
+        log "Creating cache symlink to $TMP_MUPEN_CACHE"
+        ln -s "$TMP_MUPEN_CACHE" "$mupen_cache_dir"
+    fi
+}
+
+# === N64 detection helper ===
+# is_n64_archive <archive>
+# returns 0 if a .z64|.n64|.v64 file is present
+is_n64_archive() {
+    local archive="$1"
+    list_archive_files "$archive" | grep -Ei '\.(z64|n64|v64)$' >/dev/null 2>&1
+}
+
+# === N64 hires texture handler (orchestrator) ===
 handle_n64_hires_texture() {
-    local rom_dir="$1"         # directory containing the .7z archive
-    local rom_basename="$2"    # ROM base name without extension
+    local rom_dir="$1"
+    local rom_basename="$2"
     local hires_dir_src="$rom_dir/hires_texture"
 
-    echo "[INFO] Nintendo 64 ROM detected. Checking texture packs..."
+    log "Nintendo 64 ROM detected. Checking texture packs..."
 
-    # Check if hires_texture directory exists
-    if [[ ! -d "$hires_dir_src" ]]; then
-        echo "[INFO] No 'hires_texture' directory found. Skipping N64 texture mount."
-        return
-    fi
+    [[ -d "$hires_dir_src" ]] || { log "No hires_texture folder found. Skipping."; return; }
 
-    # Find .erofs file
     local erofs_file
-    erofs_file=$(find "$hires_dir_src" -maxdepth 1 -type f -iname "*.erofs" | head -n 1)
-
-    if [[ -z "$erofs_file" ]]; then
-        echo "[INFO] No .erofs texture file found. Skipping N64 mount."
-        return
-    fi
+    erofs_file=$(find "$hires_dir_src" -maxdepth 1 -type f -iname "*.erofs" | head -n 1 || true)
+    [[ -n "$erofs_file" ]] || { log "No .erofs file found in hires_texture. Skipping."; return; }
 
     local erofs_name
     erofs_name=$(basename "$erofs_file" .erofs)
 
-    # RetroArch flatpak
     local ra_flatpak="$HOME/.var/app/org.libretro.RetroArch/config/retroarch/system/Mupen64plus"
-
-    # RetroArch local
     local ra_local="$HOME/.config/retroarch/system/Mupen64plus"
-
     local target_base=""
 
-    # Priority check — but **only if folder exists**
     if [[ -d "$ra_flatpak" ]]; then
         target_base="$ra_flatpak"
     elif [[ -d "$ra_local" ]]; then
         target_base="$ra_local"
     else
-        echo "[INFO] No RetroArch Mupen64plus folder found. Skipping N64 texture mount."
+        log "No Mupen64plus folder found in RetroArch config. Skipping textures."
         return
     fi
 
     local target_mount="$target_base/hires_texture/$erofs_name"
-    mkdir -p "$target_mount"
+    mkdir -p "$(dirname "$target_mount")"   # ensure hires_texture parent exists (but do not create Mupen64plus root if it didn't exist)
 
-    # Check sudo availability
-    if sudo -n true 2>/dev/null; then
-        CAN_SUDO=true
-        echo "[INFO] sudo available for mount."
+    # prepare cache BEFORE mount
+    prepare_mupen_cache "$target_base"
+
+    # perform mount using generic function
+    if mount_erofs_texture "$erofs_file" "$target_mount"; then
+        log "Texture mounted successfully."
     else
-        CAN_SUDO=false
-        echo "[INFO] sudo NOT available for mount."
+        warn "Texture mount failed — continuing without hires textures."
     fi
-
-    # === Prepare cache BEFORE mount ===
-    local mupen_cache_dir="$target_base/cache"
-    mkdir -p /tmp/Mupen64plusCache
-
-    if [[ -e "$mupen_cache_dir" ]]; then
-        if [[ -L "$mupen_cache_dir" ]]; then
-            local real_target
-            real_target=$(readlink -f "$mupen_cache_dir")
-
-            if [[ "$real_target" != "/tmp/Mupen64plusCache" ]]; then
-                echo "[INFO] Updating incorrect cache symlink..."
-                rm -f "$mupen_cache_dir"
-                ln -s /tmp/Mupen64plusCache "$mupen_cache_dir"
-            else
-                echo "[INFO] Cache already using /tmp/Mupen64plusCache."
-            fi
-        else
-            echo "[INFO] Replacing existing cache directory with symlink..."
-            rm -rf "$mupen_cache_dir"
-            ln -s /tmp/Mupen64plusCache "$mupen_cache_dir"
-        fi
-    else
-        echo "[INFO] Creating cache symlink to /tmp."
-        ln -s /tmp/Mupen64plusCache "$mupen_cache_dir"
-    fi
-
-    # === Unmount old mount if needed ===
-    if mountpoint -q "$target_mount"; then
-        echo "[INFO] Unmounting previous mount at $target_mount..."
-
-        if $CAN_SUDO; then
-            sudo umount "$target_mount" 2>/dev/null || fusermount -u "$target_mount"
-        else
-            fusermount -u "$target_mount" 2>/dev/null
-        fi
-    fi
-
-    echo "[INFO] Attempting to mount EROFS texture: $erofs_file"
-
-    # === Attempt kernel mount ===
-    if $CAN_SUDO; then
-        echo sudo mount -t erofs "$erofs_file" "$target_mount"
-        if sudo mount -t erofs "$erofs_file" "$target_mount" 2>/dev/null; then
-            echo "[INFO] Mounted via kernel EROFS driver."
-            return
-        fi
-    fi
-
-    # === Attempt FUSE mount ===
-    if command -v erofs-fuse >/dev/null; then
-        if erofs-fuse "$erofs_file" "$target_mount" 2>/dev/null; then
-            echo "[INFO] Mounted via erofs-fuse."
-            return
-        fi
-    fi
-
-    echo "[ERROR] Failed to mount EROFS texture file: $erofs_file"
 }
 
+# === MAIN ===
 
-# === Handle .scummvm special case ===
+# Get args and ROM info
+CMD_ARGS=("${@:1:$(($#-1))}")
+ROM_INPUT="${!#}"
+ROM_DIR=$(dirname "$ROM_INPUT")
+ROM_FILENAME=$(basename "$ROM_INPUT")
+ROM_BASENAME="${ROM_FILENAME%.*}"
+ROM_EXT="${ROM_FILENAME##*.}"
+EXTRACTED=""
+
+# === scummvm special case ===
 if [[ "$ROM_INPUT" == *.scummvm ]]; then
-    echo "[INFO] Detected .scummvm file"
+    log "Detected .scummvm file"
 
     ARCHIVE_PATH="$ROM_DIR/$ROM_BASENAME.7z"
     TARGET_DIR="$CACHE_DIR/scummvm/$ROM_BASENAME"
 
-    if [[ ! -f "$ARCHIVE_PATH" ]]; then
-        echo "[ERROR] Required archive not found: $ARCHIVE_PATH" >&2
-        exit 1
-    fi
+    [[ -f "$ARCHIVE_PATH" ]] || die "Required archive not found: $ARCHIVE_PATH"
 
-    # List archive contents
-    FILES=$(7z l -ba "$ARCHIVE_PATH" | sed -E 's/^.{53}//' | sed 's/^[ ]*//')
+    FILES=$(list_archive_files "$ARCHIVE_PATH")
 
-    # Try exact match (folder)
+    # exact folder match
     MATCHED=""
     while IFS= read -r file; do
-        [[ "$file" == "$ROM_BASENAME/"* ]] && MATCHED="$ROM_BASENAME" && break
+        [[ "$file" == "$ROM_BASENAME/"* ]] && { MATCHED="$ROM_BASENAME"; break; }
     done <<< "$FILES"
 
-    # Fallback with "__"
+    # fallback with __ prefix
     if [[ -z "$MATCHED" && "$ROM_BASENAME" == *"__"* ]]; then
         BASE_PREFIX="${ROM_BASENAME%%__*}"
         while IFS= read -r file; do
-            [[ "$file" == "$BASE_PREFIX/"* ]] && MATCHED="$BASE_PREFIX" && break
+            [[ "$file" == "$BASE_PREFIX/"* ]] && { MATCHED="$BASE_PREFIX"; break; }
         done <<< "$FILES"
     fi
 
-    if [[ -z "$MATCHED" ]]; then
-        echo "[ERROR] No matching folder found inside archive." >&2
-        exit 1
-    fi
+    [[ -n "$MATCHED" ]] || die "No matching folder found inside archive."
 
     TARGET_DIR="$CACHE_DIR/scummvm/$MATCHED"
 
     if [[ -d "$TARGET_DIR" && -n "$(ls -A "$TARGET_DIR")" ]]; then
-        echo "[INFO] Archive already extracted, skipping extraction."
+        log "Archive folder already extracted, skipping extraction."
     else
-        echo "[INFO] Extracting folder '$MATCHED/' to: $TARGET_DIR"
-        mkdir -p "$TARGET_DIR"
-        7z x -y "$ARCHIVE_PATH" -o"$CACHE_DIR/scummvm" "$MATCHED/*" || {
-            echo "[ERROR] Failed to extract folder." >&2
-            exit 1
-        }
+        log "Extracting folder '$MATCHED/' to: $TARGET_DIR"
+        extract_folder_from_archive "$ARCHIVE_PATH" "$MATCHED" "$CACHE_DIR/scummvm" || die "Failed to extract folder."
     fi
 
-    echo "[INFO] Copying .scummvm file to extracted folder"
-    cp -u "$ROM_INPUT" "$TARGET_DIR/" || {
-        echo "[ERROR] Failed to copy .scummvm file." >&2
-        exit 1
-    }
+    log "Copying .scummvm file to extracted folder"
+    cp -u "$ROM_INPUT" "$TARGET_DIR/" || die "Failed to copy .scummvm file."
 
     ROM_INPUT="$TARGET_DIR/$ROM_FILENAME"
 
-    # === Apply .ini game config if exists ===
+    # apply game ini via crudini (if available)
     GAME_INI="$ROM_DIR/$ROM_BASENAME.ini"
-    if [[ -f "$GAME_INI" ]]; then
-        echo "[INFO] Found custom game .ini: $GAME_INI"
-
-        # Extract gameid from .scummvm (first line should contain it)
+    if [[ -f "$GAME_INI" && "$HAVE_CRUDINI" == true ]]; then
+        log "Found custom game .ini: $GAME_INI"
         GAME_ID=$(head -n 1 "$ROM_INPUT" | tr -d '[]')
-        echo "[INFO] Detected gameid section: [$GAME_ID]"
+        log "Detected gameid section: [$GAME_ID]"
 
-        # Paths to check for scummvm.ini
         declare -a scummvm_paths=(
             "$HOME/.config/retroarch/system/scummvm.ini"
             "$HOME/.var/app/org.libretro.RetroArch/config/retroarch/system/scummvm.ini"
@@ -212,43 +282,43 @@ if [[ "$ROM_INPUT" == *.scummvm ]]; then
 
         SCUMMVM_INI_PATH=""
         for p in "${scummvm_paths[@]}"; do
-            if [[ -f "$p" ]]; then
-                SCUMMVM_INI_PATH="$p"
-                break
-            fi
+            [[ -f "$p" ]] && { SCUMMVM_INI_PATH="$p"; break; }
         done
 
         if [[ -n "$SCUMMVM_INI_PATH" ]]; then
-            echo "[INFO] Found scummvm.ini at: $SCUMMVM_INI_PATH"
+            log "Found scummvm.ini at: $SCUMMVM_INI_PATH"
 
-            # Read all keys from GAME_INI for the gameid, but reversed
-            mapfile -t keys < <(crudini --get "$GAME_INI" "$GAME_ID")
+            # ensure path is correct in the local game ini first
+            crudini --set "$GAME_INI" "$GAME_ID" path "$TARGET_DIR"
 
-            # Apply all keys to SCUMMVM_INI_PATH
+            # merge keys (order preservation not strict; crudini handles overwrite)
+            mapfile -t keys < <(crudini --get "$GAME_INI" "$GAME_ID" || true)
             for key in "${keys[@]}"; do
-                value=$(crudini --get "$GAME_INI" "$GAME_ID" "$key")
+                value=$(crudini --get "$GAME_INI" "$GAME_ID" "$key" 2>/dev/null || true)
                 crudini --set "$SCUMMVM_INI_PATH" "$GAME_ID" "$key" "$value"
             done
 
-            # Ensure correct path in GAME_INI before merge
-            crudini --set "$SCUMMVM_INI_PATH" "$GAME_ID" path "$TARGET_DIR"
+            # normalize spacing to scummvm style
+            sed -i 's/ = /=/g' "$SCUMMVM_INI_PATH"
 
-            echo "[INFO] Game settings for [$GAME_ID] applied via crudini."
+            log "Game settings for [$GAME_ID] applied via crudini."
         else
-            echo "[WARN] No scummvm.ini found to apply settings."
+            warn "No scummvm.ini found to apply settings."
         fi
+    else
+        [[ -f "$GAME_INI" ]] && warn "crudini not available; skipping INI merge."
     fi
 
-# === Handle .7z compressed ROMs (regular case) ===
+# === Handle plain .7z archives ===
 elif [[ "$ROM_INPUT" == *.7z ]]; then
     ARCHIVE="$ROM_INPUT"
     ARCHIVE_BASE="${ROM_BASENAME}"
 
-    echo "[INFO] Detected archive: $ARCHIVE"
+    log "Detected archive: $ARCHIVE"
 
-    FILES=$(7z l -ba "$ARCHIVE" | sed -E 's/^.{53}//' | sed 's/^[ ]*//')
+    FILES=$(list_archive_files "$ARCHIVE")
 
-    # Try exact match
+    # Try exact match file inside archive
     MATCHED=""
     while IFS= read -r file; do
         base="${file%.*}"
@@ -273,40 +343,26 @@ elif [[ "$ROM_INPUT" == *.7z ]]; then
         done <<< "$FILES"
     fi
 
-    if [[ -z "$MATCHED" ]]; then
-        echo "[ERROR] No match found inside archive." >&2
-        exit 1
-    fi
+    [[ -n "$MATCHED" ]] || die "No match found inside archive."
 
-    echo "[INFO] Extracting '$MATCHED' to '$EXTRACTED'..."
-    7z e -y -so "$ARCHIVE" "$MATCHED" > "$EXTRACTED" || {
-        echo "[ERROR] Extraction failed." >&2
-        exit 1
-    }
+    log "Extracting '$MATCHED' to '$EXTRACTED'..."
+    extract_file_from_archive "$ARCHIVE" "$MATCHED" "$EXTRACTED" || die "Extraction failed."
 
     link_related_files
     ROM_INPUT="$EXTRACTED"
 
-    # Check if ROM is Nintendo 64 by looking at the extension inside the archive
-    FIRST_FILE=$(echo "$FILES" | grep -Ei '\.(z64|n64|v64)$' | head -n 1)
-    IS_N64=false
-    [[ -n "$FIRST_FILE" ]] && IS_N64=true
-
-    # Isolated Nintendo 64 handler
-    if $IS_N64; then
+    # Detect N64 ROM inside archive (function)
+    if is_n64_archive "$ARCHIVE"; then
         handle_n64_hires_texture "$ROM_DIR" "$ARCHIVE_BASE"
     fi
 
-# === Handle non-archive ROMs (e.g., .bps passed directly) ===
+# === non-archives (copy to cache) ===
 else
-    cp "$ROM_INPUT" "$CACHE_DIR/" || {
-        echo "[ERROR] Failed to copy ROM." >&2
-        exit 1
-    }
+    cp "$ROM_INPUT" "$CACHE_DIR/" || die "Failed to copy ROM."
     ROM_INPUT="$CACHE_DIR/$(basename "$ROM_INPUT")"
     link_related_files
 fi
 
 # === Launch emulator ===
-echo "[INFO] Launching emulator..."
+log "Launching emulator..."
 exec "${CMD_ARGS[@]}" "$ROM_INPUT"
