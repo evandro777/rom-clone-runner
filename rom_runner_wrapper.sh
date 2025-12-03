@@ -38,12 +38,46 @@ list_archive_files() {
     7z l -ba "$archive" | sed -E 's/^.{53}//' | sed 's/^[ ]*//'
 }
 
-# Extract a single file from archive to destination (stream extract)
+# Extract a file from archive to destination (stream extract)
 extract_file_from_archive() {
     local archive="$1"
     local file_in_archive="$2"
     local dest="$3"
-    7z e -y -so "$archive" "$file_in_archive" > "$dest"
+
+    # Ensure parent dir exists
+    mkdir -p "$(dirname "$dest")"
+
+    # If destination exists, check if extraction is really needed
+    if [[ -f "$dest" ]]; then
+        # Get expected size from 7z listing (4th column: size in bytes)
+        local expected_size
+        expected_size=$(7z l -ba "$archive" "$file_in_archive" | awk 'NF>=4 {print $4; exit}')
+
+        if [[ -n "$expected_size" && "$expected_size" != "-" ]]; then
+            local existing_size
+            existing_size=$(stat -c%s "$dest")
+
+            if [[ "$existing_size" == "$expected_size" ]]; then
+                log "File already extracted and size matches — skipping: $(basename "$dest")"
+                return 0
+            else
+                log "Existing file differs in size — re-extracting: $(basename "$dest")"
+            fi
+        else
+            log "Could not determine expected size from archive — forcing re-extraction."
+        fi
+    fi
+
+    # Extract (overwrite via shell redirection)
+    log "Extracting file: $file_in_archive → $dest"
+
+    if ! 7z e -y -so "$archive" "$file_in_archive" > "$dest"; then
+        error "Extraction failed for: $file_in_archive"
+        rm -f "$dest" 2>/dev/null || true
+        return 1
+    fi
+
+    return 0
 }
 
 # Extract a folder from archive into a parent dir (creates parent_dir/folder...)
@@ -60,7 +94,8 @@ link_related_files() {
     # depends on ROM_DIR, ROM_BASENAME, ROM_FILENAME existing in caller scope
     log "Linking companion files..."
     while IFS= read -r f; do
-        local target="$CACHE_DIR/$(basename "$f")"
+        local target
+        target="$CACHE_DIR/$(basename "$f")"
         [[ -e "$target" ]] || ln -s "$(realpath "$f")" "$target"
     done < <(find "$ROM_DIR" -maxdepth 1 -type f -name "$ROM_BASENAME.*" ! -name "$ROM_FILENAME")
 }
@@ -213,6 +248,137 @@ handle_n64_hires_texture() {
     fi
 }
 
+# === SNES detection helper ===
+# is_snes_archive <archive>
+# returns 0 if archive contains a .sfc or .smc file
+is_snes_archive() {
+    local archive="$1"
+    list_archive_files "$archive" | grep -Ei '\.(sfc|smc)$' >/dev/null 2>&1
+}
+
+# === SNES MSU-1 handler (creates pcm symlinks into CACHE_DIR) ===
+# handle_snes_msu <rom_dir> <rom_basename>
+handle_snes_msu() {
+    local rom_dir="$1"
+    local rom_basename="$2"
+
+    log "Checking SNES/MSU-1 extras for '$rom_basename'..."
+
+    # .msu must exist for MSU-1
+    local msu_file="$rom_dir/$rom_basename.msu"
+    if [[ ! -f "$msu_file" ]]; then
+        log "No .msu file found — skipping MSU-1 handling."
+        return
+    fi
+
+    log ".msu file present — scanning for PCM tracks..."
+
+    # === 1. Search for existing .pcm files ===
+    local -a pcms=()
+    while IFS= read -r -d '' pcm; do
+        pcms+=("$pcm")
+    done < <(find "$rom_dir" -maxdepth 1 -type f -iname "$rom_basename-*.pcm" -print0 2>/dev/null)
+
+    # If PCM files exist, create symlinks and finish
+    if [[ ${#pcms[@]} -gt 0 ]]; then
+        log "Found ${#pcms[@]} PCM track(s). Linking..."
+
+        for pcm in "${pcms[@]}"; do
+            local real_p
+            real_p=$(realpath "$pcm")
+            local link="$CACHE_DIR/$(basename "$real_p")"
+
+            rm -f "$link" 2>/dev/null || true
+            ln -s "$real_p" "$link"
+
+            log "Linked PCM: $(basename "$link")"
+        done
+
+        log "MSU-1 PCM assets prepared."
+        return
+    fi
+
+    # === 2. No PCM → Try converting WV or FLAC → PCM if ffmpeg is available ===
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        log "No PCM files and ffmpeg not installed — cannot build MSU-1 audio."
+        return
+    fi
+
+    #
+    # === Try WavPack (*.wv) first ===
+    #
+    log "No .pcm files found — searching for WavPack (*.wv) tracks..."
+
+    local -a wv_files=()
+    while IFS= read -r -d '' wv; do
+        wv_files+=("$wv")
+    done < <(find "$rom_dir" -maxdepth 1 -type f -iname "$rom_basename-*.wv" -print0 2>/dev/null)
+
+    #
+    # === If no WavPack found, search for FLAC (*.flac) ===
+    #
+    if [[ ${#wv_files[@]} -eq 0 ]]; then
+        log "No .wv files found — searching for FLAC (*.flac) tracks..."
+
+        while IFS= read -r -d '' flac; do
+            wv_files+=("$flac")   # reuse array (same suffix logic)
+        done < <(find "$rom_dir" -maxdepth 1 -type f -iname "$rom_basename-*.flac" -print0 2>/dev/null)
+
+        if [[ ${#wv_files[@]} -eq 0 ]]; then
+            log "No .wv or .flac files found — cannot build MSU-1 audio."
+            return
+        else
+            log "Found ${#wv_files[@]} FLAC track(s). Converting to PCM..."
+        fi
+    else
+        log "Found ${#wv_files[@]} WavPack track(s). Converting to PCM..."
+    fi
+
+
+    #
+    # === Convert WV/FLAC → PCM (multi-core, and skip existing PCM) ===
+    #
+    for src in "${wv_files[@]}"; do
+        (
+            local real_src
+            real_src=$(realpath "$src")
+
+            local filename
+            filename=$(basename "$real_src")
+
+            local suffix="${filename#"$rom_basename-"}"
+            suffix="${suffix%.*}"   # strip extension (.wv or .flac)
+
+            local pcm_out="$CACHE_DIR/$rom_basename-$suffix.pcm"
+
+            # Skip conversion if PCM already exists in cache
+            if [[ -f "$pcm_out" ]]; then
+                log "PCM already exists — skipping conversion: $(basename "$pcm_out")"
+                return
+            fi
+
+            log "Converting: $filename → $(basename "$pcm_out")"
+
+            ffmpeg -hide_banner -loglevel error -threads 0 \
+                -i "$real_src" \
+                -c:a pcm_s16le -ar 44100 -ac 2 -f s16le \
+                "$pcm_out"
+
+            if [[ $? -ne 0 ]]; then
+                warn "Failed to convert: $filename"
+                rm -f "$pcm_out" 2>/dev/null || true
+            else
+                log "Created PCM: $(basename "$pcm_out")"
+            fi
+        ) &
+    done
+
+    # Wait for all parallel conversions to complete
+    wait
+
+    log "MSU-1 audio conversion complete."
+}
+
 # === MAIN ===
 
 # Get args and ROM info
@@ -350,6 +516,12 @@ elif [[ "$ROM_INPUT" == *.7z ]]; then
 
     link_related_files
     ROM_INPUT="$EXTRACTED"
+
+    # Detect SNES (sfc/smc) and N64 inside archive (functions)
+    if is_snes_archive "$ARCHIVE"; then
+        # handle SNES special cases (MSU-1 .msu and .pcm symlinks)
+        handle_snes_msu "$ROM_DIR" "$ARCHIVE_BASE"
+    fi
 
     # Detect N64 ROM inside archive (function)
     if is_n64_archive "$ARCHIVE"; then
