@@ -3,8 +3,10 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # === CONFIG ===
-CACHE_DIR="/tmp/rom_runner_wrapper"
-TMP_MUPEN_CACHE="/tmp/Mupen64plusCache"
+# ROM_RUNNER_CACHE_DIR => Environment variable to customize.
+# Example: ROM_RUNNER_CACHE_DIR="$HOME/.cache/rom_runner_wrapper" rom_runner_wrapper flatpak run org.libretro.RetroArch --verbose -L "snes9x_libretro.so" "Rock 'N' Roll Racing (Europe).sfc"
+CACHE_DIR="${ROM_RUNNER_CACHE_DIR:-/tmp/rom_runner_wrapper}"
+TMP_MUPEN_CACHE="${CACHE_DIR}/Mupen64plusCache"
 mkdir -p "$CACHE_DIR"
 
 # === Logging helpers ===
@@ -89,13 +91,13 @@ extract_folder_from_archive() {
     7z x -y "$archive" "$folder_in_archive/*" -o"$parent_dir"
 }
 
-# Link companion files (create symlinks in cache dir)
+# Link companion files (create symlinks in TARGET_DIR)
 link_related_files() {
-    # depends on ROM_DIR, ROM_BASENAME, ROM_FILENAME existing in caller scope
-    log "Linking companion files..."
+    # depends on ROM_DIR, ROM_BASENAME, ROM_FILENAME, TARGET_DIR existing in caller scope
+    log "Linking companion files into: $TARGET_DIR"
     while IFS= read -r f; do
         local target
-        target="$CACHE_DIR/$(basename "$f")"
+        target="$TARGET_DIR/$(basename "$f")"
         [[ -e "$target" ]] || ln -s "$(realpath "$f")" "$target"
     done < <(find "$ROM_DIR" -maxdepth 1 -type f -name "$ROM_BASENAME.*" ! -name "$ROM_FILENAME")
 }
@@ -256,7 +258,7 @@ is_snes_archive() {
     list_archive_files "$archive" | grep -Ei '\.(sfc|smc)$' >/dev/null 2>&1
 }
 
-# === SNES MSU-1 handler (creates pcm symlinks into CACHE_DIR) ===
+# === SNES MSU-1 handler (creates pcm into TARGET_DIR) ===
 # handle_snes_msu <rom_dir> <rom_basename>
 handle_snes_msu() {
     local rom_dir="$1"
@@ -279,14 +281,14 @@ handle_snes_msu() {
         pcms+=("$pcm")
     done < <(find "$rom_dir" -maxdepth 1 -type f -iname "$rom_basename-*.pcm" -print0 2>/dev/null)
 
-    # If PCM files exist, create symlinks and finish
+    # If PCM files exist, create symlinks into TARGET_DIR and finish
     if [[ ${#pcms[@]} -gt 0 ]]; then
-        log "Found ${#pcms[@]} PCM track(s). Linking..."
+        log "Found ${#pcms[@]} PCM track(s). Linking into $TARGET_DIR..."
 
         for pcm in "${pcms[@]}"; do
             local real_p
             real_p=$(realpath "$pcm")
-            local link="$CACHE_DIR/$(basename "$real_p")"
+            local link="$TARGET_DIR/$(basename "$real_p")"
 
             rm -f "$link" 2>/dev/null || true
             ln -s "$real_p" "$link"
@@ -321,7 +323,7 @@ handle_snes_msu() {
         log "No .wv files found — searching for FLAC (*.flac) tracks..."
 
         while IFS= read -r -d '' flac; do
-            wv_files+=("$flac")   # reuse array (same suffix logic)
+            wv_files+=("$flac")   # reuse array
         done < <(find "$rom_dir" -maxdepth 1 -type f -iname "$rom_basename-*.flac" -print0 2>/dev/null)
 
         if [[ ${#wv_files[@]} -eq 0 ]]; then
@@ -334,10 +336,7 @@ handle_snes_msu() {
         log "Found ${#wv_files[@]} WavPack track(s). Converting to PCM..."
     fi
 
-
-    #
     # === Convert WV/FLAC → PCM (multi-core, and skip existing PCM) ===
-    #
     for src in "${wv_files[@]}"; do
         (
             local real_src
@@ -349,7 +348,7 @@ handle_snes_msu() {
             local suffix="${filename#"$rom_basename-"}"
             suffix="${suffix%.*}"   # strip extension (.wv or .flac)
 
-            local pcm_out="$CACHE_DIR/$rom_basename-$suffix.pcm"
+            local pcm_out="$TARGET_DIR/$rom_basename-$suffix.pcm"
 
             # Skip conversion if PCM already exists in cache
             if [[ -f "$pcm_out" ]]; then
@@ -389,6 +388,7 @@ ROM_FILENAME=$(basename "$ROM_INPUT")
 ROM_BASENAME="${ROM_FILENAME%.*}"
 ROM_EXT="${ROM_FILENAME##*.}"
 EXTRACTED=""
+TARGET_DIR="$CACHE_DIR"   # default, overridden for archives / organized cases
 
 # === scummvm special case ===
 if [[ "$ROM_INPUT" == *.scummvm ]]; then
@@ -490,7 +490,6 @@ elif [[ "$ROM_INPUT" == *.7z ]]; then
         base="${file%.*}"
         if [[ "$base" == "$ARCHIVE_BASE" ]]; then
             MATCHED="$file"
-            EXTRACTED="$CACHE_DIR/$(basename "$file")"
             break
         fi
     done <<< "$FILES"
@@ -501,9 +500,7 @@ elif [[ "$ROM_INPUT" == *.7z ]]; then
         while IFS= read -r file; do
             base="${file%.*}"
             if [[ "$base" == "$BASE_PREFIX" ]]; then
-                EXT="${file##*.}"
                 MATCHED="$file"
-                EXTRACTED="$CACHE_DIR/$ARCHIVE_BASE.$EXT"
                 break
             fi
         done <<< "$FILES"
@@ -511,7 +508,18 @@ elif [[ "$ROM_INPUT" == *.7z ]]; then
 
     [[ -n "$MATCHED" ]] || die "No match found inside archive."
 
-    log "Extracting '$MATCHED' to '$EXTRACTED'..."
+    # Build structured TARGET_DIR: /tmp/rom_runner_wrapper/<ext>/<archive_base>/
+    EXT="${MATCHED##*.}"
+    EXT_LOWER="${EXT,,}"
+
+    # Structured output
+    TARGET_DIR="$CACHE_DIR/$EXT_LOWER/$ARCHIVE_BASE"
+    mkdir -p "$TARGET_DIR"
+
+    # Preserve 7z filename → rename extracted file to <ARCHIVE_BASE>.<ext>
+    EXTRACTED="$TARGET_DIR/$ARCHIVE_BASE.$EXT"
+
+    log "Extracting '$MATCHED' → '$EXTRACTED' (preserving softpatch naming)"
     extract_file_from_archive "$ARCHIVE" "$MATCHED" "$EXTRACTED" || die "Extraction failed."
 
     link_related_files
@@ -519,19 +527,22 @@ elif [[ "$ROM_INPUT" == *.7z ]]; then
 
     # Detect SNES (sfc/smc) and N64 inside archive (functions)
     if is_snes_archive "$ARCHIVE"; then
-        # handle SNES special cases (MSU-1 .msu and .pcm symlinks)
         handle_snes_msu "$ROM_DIR" "$ARCHIVE_BASE"
     fi
 
-    # Detect N64 ROM inside archive (function)
     if is_n64_archive "$ARCHIVE"; then
         handle_n64_hires_texture "$ROM_DIR" "$ARCHIVE_BASE"
     fi
 
-# === non-archives (copy to cache) ===
+# === non-archives (copy to structured cache) ===
 else
-    cp "$ROM_INPUT" "$CACHE_DIR/" || die "Failed to copy ROM."
-    ROM_INPUT="$CACHE_DIR/$(basename "$ROM_INPUT")"
+    # Build structured TARGET_DIR: /tmp/rom_runner_wrapper/<ext>/<basename>/
+    EXT_LOWER="${ROM_EXT,,}"
+    TARGET_DIR="$CACHE_DIR/$EXT_LOWER/$ROM_BASENAME"
+    mkdir -p "$TARGET_DIR"
+
+    cp "$ROM_INPUT" "$TARGET_DIR/" || die "Failed to copy ROM."
+    ROM_INPUT="$TARGET_DIR/$(basename "$ROM_INPUT")"
     link_related_files
 fi
 
