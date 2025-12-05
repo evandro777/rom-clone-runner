@@ -98,8 +98,8 @@ link_related_files() {
     while IFS= read -r f; do
         local target
         target="$TARGET_DIR/$(basename "$f")"
-        [[ -e "$target" ]] || ln -s "$(realpath "$f")" "$target"
-    done < <(find "$ROM_DIR" -maxdepth 1 -type f -name "$ROM_BASENAME.*" ! -name "$ROM_FILENAME")
+        [[ -e "$target" ]] || ln -sf "$(realpath "$f")" "$target"
+    done < <(find "$ROM_DIR" -maxdepth 1 -xtype f -name "$ROM_BASENAME.*" ! -name "$ROM_FILENAME")
 }
 
 # === Helpers for sudo / mounts ===
@@ -217,7 +217,7 @@ handle_n64_hires_texture() {
     [[ -d "$hires_dir_src" ]] || { log "No hires_texture folder found. Skipping."; return; }
 
     local erofs_file
-    erofs_file=$(find "$hires_dir_src" -maxdepth 1 -type f -iname "*.erofs" | head -n 1 || true)
+    erofs_file=$(find "$hires_dir_src" -maxdepth 1 -xtype f -iname "*.erofs" | head -n 1 || true)
     [[ -n "$erofs_file" ]] || { log "No .erofs file found in hires_texture. Skipping."; return; }
 
     local erofs_name
@@ -279,7 +279,7 @@ handle_snes_msu() {
     local -a pcms=()
     while IFS= read -r -d '' pcm; do
         pcms+=("$pcm")
-    done < <(find "$rom_dir" -maxdepth 1 -type f -iname "$rom_basename-*.pcm" -print0 2>/dev/null)
+    done < <(find "$rom_dir" -maxdepth 1 -xtype f -iname "$rom_basename-*.pcm" -print0 2>/dev/null)
 
     # If PCM files exist, create symlinks into TARGET_DIR and finish
     if [[ ${#pcms[@]} -gt 0 ]]; then
@@ -314,7 +314,7 @@ handle_snes_msu() {
     local -a wv_files=()
     while IFS= read -r -d '' wv; do
         wv_files+=("$wv")
-    done < <(find "$rom_dir" -maxdepth 1 -type f -iname "$rom_basename-*.wv" -print0 2>/dev/null)
+    done < <(find "$rom_dir" -maxdepth 1 -xtype f -iname "$rom_basename-*.wv" -print0 2>/dev/null)
 
     #
     # === If no WavPack found, search for FLAC (*.flac) ===
@@ -323,8 +323,8 @@ handle_snes_msu() {
         log "No .wv files found — searching for FLAC (*.flac) tracks..."
 
         while IFS= read -r -d '' flac; do
-            wv_files+=("$flac")   # reuse array
-        done < <(find "$rom_dir" -maxdepth 1 -type f -iname "$rom_basename-*.flac" -print0 2>/dev/null)
+            wv_files+=("$flac") # reuse array
+        done < <(find "$rom_dir" -maxdepth 1 -xtype f -iname "$rom_basename-*.flac" -print0 2>/dev/null)
 
         if [[ ${#wv_files[@]} -eq 0 ]]; then
             log "No .wv or .flac files found — cannot build MSU-1 audio."
@@ -336,25 +336,30 @@ handle_snes_msu() {
         log "Found ${#wv_files[@]} WavPack track(s). Converting to PCM..."
     fi
 
+    #
     # === Convert WV/FLAC → PCM (multi-core, and skip existing PCM) ===
+    #
     for src in "${wv_files[@]}"; do
         (
-            local real_src
-            real_src=$(realpath "$src")
-
+            # Keep original symlink name for suffix computation
             local filename
-            filename=$(basename "$real_src")
+            filename=$(basename "$src")
 
+            # Suffix is everything after "<rom_basename>-"
             local suffix="${filename#"$rom_basename-"}"
             suffix="${suffix%.*}"   # strip extension (.wv or .flac)
 
             local pcm_out="$TARGET_DIR/$rom_basename-$suffix.pcm"
 
-            # Skip conversion if PCM already exists in cache
+            # Skip conversion if PCM already exists
             if [[ -f "$pcm_out" ]]; then
                 log "PCM already exists — skipping conversion: $(basename "$pcm_out")"
                 return
             fi
+
+            # Real path only for ffmpeg input (symlink-safe)
+            local real_src
+            real_src=$(realpath "$src")
 
             log "Converting: $filename → $(basename "$pcm_out")"
 
