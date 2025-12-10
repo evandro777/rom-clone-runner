@@ -10,13 +10,13 @@ TMP_MUPEN_CACHE="${CACHE_DIR}/Mupen64plusCache"
 mkdir -p "$CACHE_DIR"
 
 # === Logging helpers ===
-log()   { printf '[INFO] %s\n' "$*"; }
-warn()  { printf '[WARN] %s\n' "$*" >&2; }
-error() { printf '[ERROR] %s\n' "$*" >&2; }
-die()   { error "$*"; exit 1; }
+function log()   { printf '[INFO] %s\n' "$*"; }
+function warn()  { printf '[WARN] %s\n' "$*" >&2; }
+function error() { printf '[ERROR] %s\n' "$*" >&2; }
+function die()   { error "$*"; exit 1; }
 
 # === Dependency check ===
-check_deps() {
+function check_deps() {
     command -v 7z >/dev/null 2>&1 || die "7z (p7zip) is required but not found."
     if command -v crudini >/dev/null 2>&1; then
         HAVE_CRUDINI=true
@@ -35,13 +35,13 @@ check_deps
 # === Utility wrappers for archive and extraction ===
 
 # Trim 7z listing to filename column (works with p7zip output)
-list_archive_files() {
+function list_archive_files() {
     local archive="$1"
     7z l -ba "$archive" | sed -E 's/^.{53}//' | sed 's/^[ ]*//'
 }
 
 # Extract a file from archive to destination (stream extract)
-extract_file_from_archive() {
+function extract_file_from_archive() {
     local archive="$1"
     local file_in_archive="$2"
     local dest="$3"
@@ -83,7 +83,7 @@ extract_file_from_archive() {
 }
 
 # Extract a folder from archive into a parent dir (creates parent_dir/folder...)
-extract_folder_from_archive() {
+function extract_folder_from_archive() {
     local archive="$1"
     local folder_in_archive="$2"   # folder name inside archive (no trailing slash)
     local parent_dir="$3"
@@ -92,7 +92,7 @@ extract_folder_from_archive() {
 }
 
 # Link companion files (create symlinks in TARGET_DIR)
-link_related_files() {
+function link_related_files() {
     # depends on ROM_DIR, ROM_BASENAME, ROM_FILENAME, TARGET_DIR existing in caller scope
     log "Linking companion files into: $TARGET_DIR"
     while IFS= read -r f; do
@@ -105,7 +105,7 @@ link_related_files() {
 # === Helpers for sudo / mounts ===
 
 # Return 0 if sudo is available non-interactively
-can_use_sudo() {
+function can_use_sudo() {
     if sudo -n true 2>/dev/null; then
         return 0
     else
@@ -116,7 +116,7 @@ can_use_sudo() {
 # Generic EROFS mount handler
 # mount_erofs_texture <erofs_file> <target_mount>
 # returns 0 on success, 1 on failure
-mount_erofs_texture() {
+function mount_erofs_texture() {
     local erofs_file="$1"
     local target_mount="$2"
 
@@ -170,7 +170,7 @@ mount_erofs_texture() {
 }
 
 # Prepare mupen cache symlink safely
-prepare_mupen_cache() {
+function prepare_mupen_cache() {
     local target_base="$1"   # Mupen64plus parent dir (not including hires_texture)
     local mupen_cache_dir="$target_base/cache"
 
@@ -201,13 +201,13 @@ prepare_mupen_cache() {
 # === N64 detection helper ===
 # is_n64_archive <archive>
 # returns 0 if a .z64|.n64|.v64 file is present
-is_n64_archive() {
+function is_n64_archive() {
     local archive="$1"
     list_archive_files "$archive" | grep -Ei '\.(z64|n64|v64)$' >/dev/null 2>&1
 }
 
 # === N64 hires texture handler (orchestrator) ===
-handle_n64_hires_texture() {
+function handle_n64_hires_texture() {
     local rom_dir="$1"
     local rom_basename="$2"
     local hires_dir_src="$rom_dir/hires_texture"
@@ -260,7 +260,7 @@ is_snes_archive() {
 
 # === SNES MSU-1 handler (creates pcm into TARGET_DIR) ===
 # handle_snes_msu <rom_dir> <rom_basename>
-handle_snes_msu() {
+function handle_snes_msu() {
     local rom_dir="$1"
     local rom_basename="$2"
 
@@ -381,6 +381,59 @@ handle_snes_msu() {
     wait
 
     log "MSU-1 audio conversion complete."
+}
+
+function is_megadrive_archive() {
+    local archive="$1"
+    list_archive_files "$archive" | grep -Ei '\.(md|bin|gen)$' >/dev/null 2>&1
+}
+
+function handle_md_plus() {
+    local rom_dir="$1"
+    local rom_basename="$2"
+
+    log "Checking Mega Drive MD+ / MSU-MD audio for '$rom_basename'..."
+
+    # .cue must exist for MD+
+    local cue_file="$rom_dir/$rom_basename.cue"
+    if [[ ! -f "$cue_file" ]]; then
+        log "No .cue file found — skipping MD+ handling."
+        return
+    fi
+
+    log ".cue file found — scanning for OGG tracks..."
+
+    # === Search for ALL .ogg files (any name) ===
+    local -a oggs=()
+    while IFS= read -r ogg; do
+        oggs+=("$ogg")
+    done < <(
+        find "$rom_dir" -maxdepth 1 -xtype f -iname "*.ogg" 2>/dev/null
+    )
+
+    if [[ ${#oggs[@]} -eq 0 ]]; then
+        warn "No .ogg tracks found — MD+ audio unavailable."
+        return
+    fi
+
+    log "Found ${#oggs[@]} OGG track(s). Linking into cache..."
+
+    # link into TARGET_DIR (same logic used everywhere)
+    for ogg in "${oggs[@]}"; do
+        local real_o
+        real_o=$(realpath "$ogg")
+
+        local link
+        link="$TARGET_DIR/$(basename "$ogg")"
+
+        # Replace if exists
+        rm -f "$link" 2>/dev/null || true
+        ln -s "$real_o" "$link"
+
+        log "Linked track: $(basename "$ogg")"
+    done
+
+    log "MD+ / MSU-MD audio assets prepared."
 }
 
 # === MAIN ===
@@ -530,12 +583,12 @@ elif [[ "$ROM_INPUT" == *.7z ]]; then
     link_related_files
     ROM_INPUT="$EXTRACTED"
 
-    # Detect SNES (sfc/smc) and N64 inside archive (functions)
+    # Special cases
     if is_snes_archive "$ARCHIVE"; then
         handle_snes_msu "$ROM_DIR" "$ARCHIVE_BASE"
-    fi
-
-    if is_n64_archive "$ARCHIVE"; then
+    elif is_megadrive_archive "$ARCHIVE"; then
+        handle_md_plus "$ROM_DIR" "$ARCHIVE_BASE"
+    elif is_n64_archive "$ARCHIVE"; then
         handle_n64_hires_texture "$ROM_DIR" "$ARCHIVE_BASE"
     fi
 
