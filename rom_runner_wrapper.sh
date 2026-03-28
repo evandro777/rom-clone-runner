@@ -176,7 +176,7 @@ function prepare_mupen_cache() {
 
     mkdir -p "$TMP_MUPEN_CACHE"
 
-    if [[ -e "$mupen_cache_dir" ]]; then
+    if [[ -L "$mupen_cache_dir" ]]; then
         if [[ -L "$mupen_cache_dir" ]]; then
             local real_target
             real_target=$(readlink -f "$mupen_cache_dir" 2>/dev/null || true)
