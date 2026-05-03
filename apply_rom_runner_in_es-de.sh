@@ -30,7 +30,7 @@ WRAPPER="rom_runner_wrapper "
 
 # MAME specific command old and new strings
 OLD_MAME_CMD='<command label="MAME - Current">%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/mame_libretro.so %ROM%</command>'
-NEW_MAME_CMD='<command label="MAME - Current">%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/mame_libretro.so %GAMEDIR%/%BASENAME%</command>'
+NEW_MAME_CMD='<command label="MAME - Current">%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/mame_libretro.so %GAMEDIR%/%BASENAME%</command>.'
 # --- End Default Configuration Constants ---
 
 
